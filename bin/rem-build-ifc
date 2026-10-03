@@ -1,0 +1,308 @@
+#!/bin/bash
+
+# Copyright 2026 Edison Design Group, Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Remote IFC Build Script
+#
+# usage: rem-build-ifc [--batch][-s|--spec <spec>][--no-clean][--direct-output]
+#                      [--failure-log-file <file>] file_path
+#
+#     --batch            Enable batch mode (for driving this script from
+#                        another script) which changes the output to be more
+#                        friendly to mass (re-)builds.
+#     -s, --spec <spec>  Attempt to build an IFC file for the given
+#                        specification version.
+#     --no-clean         Leave the remote directory around.
+#     --direct-output    Include the direct output from the remote script.
+#                        This should only be used for debugging crashes in the
+#                        remote script, under normal operation this will
+#                        give no additional output other than a terminal reset.
+#     --failure-log-file Include the name of the test in the given failure log
+#                        file. This caller is responsible for creating the file
+#                        if using this flag.
+#
+# At a high level this script creates a remote working directory on msvs,
+# uploads the specified file, builds any related IFC file(s) for it, then
+# downloads the IFC file(s) back to the current directory, then finally removes
+# the remote working directory.
+#
+# The remote server is expected to meet the following requirements:
+# - Running Windows with Command Prompt as the default SSH shell
+# - Has a properly configured EDG "build-ifc.py" at C:\RemIFC\build-ifc.py
+# - Has a tmp directory for IFC builds at C:\RemIFC\builds with write access
+#   available for the user(s) attempting to run this script
+
+# Controls the spec to build.
+spec='latest'
+# Controls the output mode. When zero more detailed verbose output will be
+# printed. When non-zero more selective output will be used with additional
+# contextual output about what's being built.
+batch_mode=0
+# Controls cleanup of the remote working directory. When non-zero, the
+# remote directory will not be deleted.
+no_clean=0
+# Controls the flow of output from the remote script execution.
+script_direct_output_dest='/dev/null'
+# Controls where this ifc build should be listed if a failure occurs. If empty
+# no logging of this ilk will occur.
+failure_log_file=''
+
+while true; do
+  case $1 in
+    -s | --spec)
+      spec=$2
+      shift
+      ;;
+    --batch)
+      batch_mode=1
+      ;;
+    --no-clean)
+      no_clean=1
+      ;;
+    --direct-output)
+      script_direct_output_dest='/dev/stdout'
+      ;;
+    --failure-log-file)
+      failure_log_file=$2
+      shift
+      ;;
+    -*)
+      echo "rem-build-ifc: $1 is an unrecognized option"
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+  shift
+done
+
+if [[ $# != 1 ]] ; then
+  echo "Expected 1 argument (the source file path or ifcspec file path), got $# arguments."
+  exit 1
+fi
+
+# Display a startup message so it's easier to figure out what file
+# is problematic
+if (( $batch_mode == 1 )) ; then
+  echo "Starting: $1"
+fi
+
+# We use C:\RemIFC\builds as an easy to cleanup parent directory (both for
+# automated and emergency cleanup), that doesn't need parents created.
+tmp_dir="C:\\RemIFC\\builds\\$(mktemp -u modules_build_XXXXXX)"
+ifc_dir=$(dirname $1)
+ifc_file=$(basename $1)
+
+# Enter the directory if it isn't the current directory. The script's
+# processing is relative to the provided input file.
+if [ "$ifc_dir" != '.' ] ; then
+  cd "$ifc_dir"
+fi
+
+# Create a remote temporary working directory.
+if (( $batch_mode == 0 )) ; then
+  echo "Making working directory directory \"$tmp_dir\"..."
+fi
+ssh msvs.edg.com "mkdir \"$tmp_dir\""
+
+# Create a local temporary output directory.
+local_tmp_dir=$(mktemp -p '' -d rem-build-ifc.tmp.XXXXXX)
+
+# Register cleanup for the aforementioned temporary directories
+function cleanup_tmp_dirs() {
+  # Cleanup local temporaries.
+  rm -rf $local_tmp_dir
+
+  # Cleanup remote temporaries.
+  if (( $no_clean == 0 )) ; then
+    if (( $batch_mode == 0 )) ; then
+      echo "Cleaning up working directory directory \"$tmp_dir\"..."
+    fi
+    ssh msvs.edg.com "rmdir /s /q $tmp_dir"
+  fi
+}
+
+trap cleanup_tmp_dirs EXIT
+
+# Check if we've been passed an ifcspec file.
+if [[ "$ifc_file" != *.ifcspec ]] ; then
+  # The file wasn't an ifcspec file. See if one exists for this file.
+  ifcspec_file="$ifc_file.ifcspec"
+  if [ ! -f "$ifcspec_file" ] ; then
+    # The file wasn't an ifcspec file, and one doesn't exist. Attempt to
+    # recover by generating an ifcspec file.
+    gen-ifcspec "$ifc_file"
+
+    # If generation fails, exit immediately.
+    if (( $? != 0 )) ; then
+      exit 1
+    fi
+
+    if (( $batch_mode == 0 )) ; then
+      echo "Generated ifcspec file: $ifcspec_file"
+    fi
+  fi
+else
+  # Use "ifc_file" itself as the spec file.
+  ifcspec_file="$ifc_file"
+fi
+
+files_to_upload=($(get-ifcspec-dependencies "$ifcspec_file"))
+
+# Expand the array of files, and upload them via scp.
+if (( $batch_mode == 0 )) ; then
+  echo "Uploading source file(s)..."
+fi
+scp ${files_to_upload[@]} msvs.edg.com:$tmp_dir
+
+# Build the module file remotely.
+# Use -o LogLevel=QUIET to get rid of the connection closed message
+#
+# We work around the following issue by writing to a log file on the remote
+# the reading that back locally.
+# https://github.com/PowerShell/Win32-OpenSSH/issues/1738
+ssh -o LogLevel=QUIET msvs.edg.com \
+  "cd $tmp_dir &&"\
+  "py C:\\RemIFC\\build-ifc.py /manifest /log /spec $spec $ifcspec_file" \
+      > "$script_direct_output_dest"
+
+# Begin retrieving the build log, and created files.
+if (( $batch_mode == 0 )) ; then
+  echo "Retrieving build log..."
+fi
+
+# Copy the output.log to the temporary output directory.
+local_output_log="$local_tmp_dir/output.log"
+edg-scp-from-win "msvs.edg.com:$tmp_dir\\output.log" "$local_output_log"
+
+# Check for failures using the build log, any one failure is considered a
+# failure of the entire build.
+if [[ -f "$local_output_log" ]] ; then
+  # We're looking for failures via grep.
+  #
+  # If there's a match that will be exit code 0.
+  # If there's a grep failure that will be exit code 2.
+  # If there's nothing that will be exit code 1.
+  #
+  # Thus, if the exit code is anything other that 1, we failed.
+  grep -q -E 'COMPILER EXIT CODE: [1-9][0-9]*' "$local_output_log"
+  failed=$(( $? != 1 ))
+else
+  failed=1
+fi
+
+# Report output with respect to our verbosity.
+if (( $batch_mode == 0 )) ; then
+  # FIXME: Provide more advanced options using the simi-structured output.
+  cat "$local_output_log"
+elif (( $failed != 0 )) ; then
+  # If we didn't get a clean exit, print the log even in batch mode
+  cat "$local_output_log"
+else
+  # Print "IFCSPEC - *" warnings and errors even in batch mode.
+  grep --text "IFCSPEC - " $local_output_log | sed -e 's/IFCSPEC - //'
+fi
+
+# Download any generated IFC files.
+if (( $batch_mode == 0 )) ; then
+  echo "Checking product manifest..."
+fi
+
+# Copy the manifest to the temporary directory for examination and processing.
+local_manifest="$local_tmp_dir/product-manifest.txt"
+edg-scp-from-win "msvs.edg.com:$tmp_dir\\product-manifest.txt" "$local_manifest"
+
+# Examine the contents of the manifest.
+files_produced=()
+mapfile -t files_produced < "$local_manifest"
+num_files_produced=${#files_produced[@]}
+
+# Check to see if we've produced at least one file.
+if (( $num_files_produced == 0 )) ; then
+  # FIXME: This is not considered a failure as when running rem-build-ifcspecs
+  # with test deletion enabled, considering this a failure results in tests
+  # being removed that shouldn't be.
+  #
+  # This should eventually be fixed by not generating those ifcspec files,
+  # however this is somewhat tricky. Perhaps, this should be handled by the
+  # cleanup script (apply-msmod-conversion-fixes) now that it exists?
+  echo "BUILD WARNING: No files generated!"
+else
+  if (( $batch_mode == 0 )) ; then
+    echo "Cloning produced file(s) back to the current directory..."
+  fi
+
+  # We produced files, download them.
+  #
+  # FIXME: Do we think parallel downloads are a good idea here? This script
+  # already runs in parallel and excessive SSH requests may result in
+  # overloading the remote server in a way that leads to script failure.
+  for new_file in ${files_produced[@]} ; do
+    base_new_file=$(basename "$new_file")
+    base_new_file_extension="${base_new_file##*.}"
+    # Skip downloading extension-less, json, pdb, idb, and pch files.
+    #
+    # FIXME: Maybe we want to move this to the build-ifc.py side for the
+    # benefit of local builds?
+    if [[ "$base_new_file_extension" == "$base_new_file" ]] ; then
+      continue
+    fi
+    if [[ "$base_new_file_extension" == "json" ]] ; then
+      continue
+    fi
+    if [[ "$base_new_file_extension" == "pdb" ]] ; then
+      continue
+    fi
+    if [[ "$base_new_file_extension" == "idb" ]] ; then
+      continue
+    fi
+    if [[ "$base_new_file_extension" == "pch" ]] ; then
+      continue
+    fi
+    # If this is a path and not just a filename, create any parent directories
+    # if they don't already exist.
+    if [[ "$base_new_file" != "$new_file" ]] ; then
+      mkdir -p $(dirname "$new_file")
+    fi
+    edg-scp-from-win "msvs.edg.com:$tmp_dir\\$new_file" "$new_file"
+  done
+fi
+
+# Print our status in batch mode, update the failure log file (if it's been
+# defined and exists), and then exit appropriately.
+if (( $failed == 0 )) ; then
+  if (( $batch_mode == 1 )) ; then
+    echo "Finished: $1"
+  fi
+
+  exit 0
+else
+  if (( $batch_mode == 1 )) ; then
+    echo "Failed: $1"
+  fi
+
+  if [[ -n "$failure_log_file" ]] && [[ -f "$failure_log_file" ]] ; then
+    echo "$1" >> "$failure_log_file"
+  fi
+
+  exit 1
+fi

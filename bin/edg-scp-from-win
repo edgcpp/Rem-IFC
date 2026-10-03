@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+
+# Copyright 2026 Edison Design Group, Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# This script should be used in place of scp when copying from a remote Windows
+# system over SSH as it performs path normalization to adapt for the host
+# system's SSH client.
+
+import os
+import re
+import subprocess
+import sys
+
+from enum import Enum
+
+SSH_VERSION_REGEX = re.compile(r'OpenSSH_([0-9]+).([0-9]+)')
+
+class Strategy(Enum):
+  TO_WIN = 1
+  TO_UNIX = 2
+
+def get_normalization_strategy() -> Strategy:
+  ssh_version_proc = subprocess.run(
+    ['ssh', '-V'],
+    stdout = subprocess.PIPE,
+    stderr = subprocess.STDOUT
+  )
+  ssh_version_output = ssh_version_proc.stdout.decode('utf-8')
+  vers_regex_match = SSH_VERSION_REGEX.search(ssh_version_output)
+
+  # Check to see if the OpenSSH version could be read (assuming OpenSSH is in
+  # use).
+  if vers_regex_match is not None:
+    major_vers = int(vers_regex_match.group(1))
+    minor_vers = int(vers_regex_match.group(2))
+
+    # Versions after 8.8 (or possibly earlier but not before 8.2) use escaped
+    # Windows style separators \\
+    if major_vers >= 8 and minor_vers >= 8:
+      return Strategy.TO_WIN
+
+  # Fallback to TO_UNIX style.
+  return Strategy.TO_UNIX
+
+TO_WIN_STYLE_REGEX = re.compile(r'[/\\]')
+TO_UNIX_STYLE_REGEX = re.compile(r'[\\]')
+
+def normalize_from(raw_from_path: str) -> str:
+  strategy = get_normalization_strategy()
+  if strategy == Strategy.TO_WIN:
+    # Convert / and \ into \\
+    return TO_WIN_STYLE_REGEX.sub(r'\\\\', raw_from_path)
+  else:
+    # Convert \ into /
+    return TO_UNIX_STYLE_REGEX.sub(r'/', raw_from_path)
+
+def exec_copy(from_path: str, to_path: str) -> None:
+  os.execvp('scp', ['scp', from_path, to_path])
+
+def main() -> None:
+  raw_from_path = sys.argv[1]
+
+  from_path = normalize_from(raw_from_path)
+  to_path = sys.argv[2]
+
+  exec_copy(from_path, to_path)
+
+main()

@@ -1,0 +1,84 @@
+#!/bin/bash
+
+# Copyright 2026 Edison Design Group, Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# ifcspec Generation Script
+#
+# usage: gen-ifcspec file_path
+#
+# Generates an ifcspec file for the given source file.
+
+ifc_dir=$(dirname $1)
+ifc_file=$(basename $1)
+
+ifcspec_file="$ifc_file.ifcspec"
+
+primary_is_header=0
+
+build_args=('/std:c++20')
+
+# Extract the file extension then automatically determine the compiler flags
+# based on the file extension
+extension="${ifc_file##*.}"
+case $extension in
+  ixx | cppm)
+    # This is a normal module interface file.
+    build_args+=('/interface' '/TP' "$ifc_file")
+    ;;
+  cpp)
+    # This is an internal partition (normally IFC files are not built for
+    # these).
+    echo "WARNING: Suspect generation of IFC for internal partition."
+    build_args+=('/internalPartition' "$ifc_file")
+    ;;
+  h | hpp)
+    # This is a module header unit.
+    build_args+=('/exportHeader' "$ifc_file")
+    primary_is_header=1
+    ;;
+  *)
+    echo "Unsupported file extension: \"$extension\""
+    echo "  Supported extensions: \"h\", \"hpp\", \"c\", \"cpp\", \"ixx\""
+    exit 1
+    ;;
+esac
+
+# Create an array of required files.
+required_files=()
+
+# Gather the required files.
+if (( $primary_is_header == 0 )) ; then
+  # We're not uploading a header, include the passed file explicitly
+  required_files+=($ifc_file)
+fi
+if compgen -G "*.h" > /dev/null ; then
+  # If there are ".h" header files present upload them as well
+  required_files+=(*.h)
+fi
+if compgen -G "*.hpp" > /dev/null ; then
+  # If there are ".hpp" header files present upload them as well
+  required_files+=(*.hpp)
+fi
+
+# Generate the ifcspec file.
+echo "BUILD_ARGS=${build_args[@]}" > "$ifcspec_file"
+echo "REQUIRES_FILES=${required_files[@]}" >> "$ifcspec_file"
+

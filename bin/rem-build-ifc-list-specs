@@ -1,0 +1,122 @@
+#!/bin/bash
+
+# Copyright 2026 Edison Design Group, Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Remote IFC Spec Listing Script
+#
+# usage: rem-build-ifc-list-specs
+#
+#     --no-clean         Leave the remote directory around.
+#     --direct-output    Include the direct output from the remote script.
+#                        This should only be used for debugging crashes in the
+#                        remote script, under normal operation this will
+#                        give no additional output other than a terminal reset.
+#
+# At a high level this script creates a remote working directory on msvs, dumps
+# the supported spec information to a log file, then downloads and prints the
+# log file before finally removing the remote and temporary working
+# directories.
+#
+
+# Controls cleanup of the remote working directory. When non-zero, the
+# remote directory will not be deleted.
+no_clean=0
+# Controls the flow of output from the remote script execution.
+script_direct_output_dest='/dev/null'
+
+while true; do
+  case $1 in
+    --no-clean)
+      no_clean=1
+      ;;
+    --direct-output)
+      script_direct_output_dest='/dev/stdout'
+      ;;
+    -*)
+      echo "rem-build-ifc-list-specs: $1 is an unrecognized option"
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+  shift
+done
+
+
+# We use C:\RemIFC\builds as an easy to cleanup parent directory (both for
+# automated and emergency cleanup), that doesn't need parents created.
+tmp_dir="C:\\RemIFC\\builds\\$(mktemp -u modules_build_XXXXXX)"
+
+# Create a remote temporary working directory.
+echo "Making working directory directory \"$tmp_dir\"..."
+ssh msvs.edg.com "mkdir \"$tmp_dir\""
+
+# Create a local temporary output directory.
+local_tmp_dir=$(mktemp -p '' -d rem-build-ifc.tmp.XXXXXX)
+
+# Register cleanup for the aforementioned temporary directories
+function cleanup_tmp_dirs() {
+  # Cleanup local temporaries.
+  rm -rf $local_tmp_dir
+
+  # Cleanup remote temporaries.
+  if (( $no_clean == 0 )) ; then
+    echo "Cleaning up working directory directory \"$tmp_dir\"..."
+    ssh msvs.edg.com "rmdir /s /q $tmp_dir"
+  fi
+}
+
+trap cleanup_tmp_dirs EXIT
+
+# Execute the query remotely.
+# Use -o LogLevel=QUIET to get rid of the connection closed message
+# Use -tt to tell ssh to always execute in a remote shell
+#
+# We work around the following issue by writing to a log file on the remote
+# the reading that back locally.
+# https://github.com/PowerShell/Win32-OpenSSH/issues/1738
+ssh -o LogLevel=QUIET -tt msvs.edg.com \
+  "cd $tmp_dir &&"\
+  "py C:\\RemIFC\\build-ifc.py /log /list-specs" \
+      > "$script_direct_output_dest"
+
+# Begin retrieving the build log, and created files.
+echo "Retrieving spec list..."
+
+function get_win_path() {
+  # Convert / and \\ (aka \) into \\\\ (aka \\)
+  echo "$1" | sed 's@[/\\]@\\\\@g'
+}
+
+function copy_from_msvs() {
+  src_path=$(get_win_path "$1")
+  dst_path="$2"
+
+  scp "$src_path" "$dst_path"
+}
+
+# Copy the output.log to the temporary output directory.
+local_output_log="$local_tmp_dir/output.log"
+copy_from_msvs "msvs.edg.com:$tmp_dir\\output.log" "$local_output_log"
+
+# Print the results
+cat "$local_output_log"

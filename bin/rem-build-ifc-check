@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+
+# Copyright 2026 Edison Design Group, Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import asyncio
+import argparse
+import re
+import subprocess
+import tempfile
+
+import edgshell
+import edgutil
+
+from pathlib import Path
+from typing import Coroutine, List, Optional, Set, Tuple
+
+def parse_args():
+  parser = argparse.ArgumentParser(
+    description = (
+      '''Test the rem-ifc system to ensure the correct IFC files are produced.
+      '''
+    )
+  )
+  return parser.parse_known_args()
+
+class RebuildStatus:
+  def __init__(self, num_total: int) -> None:
+    self.num_completed = 0
+    self.num_total = num_total
+
+SupportedFormat = Tuple[str, str]
+SupportedFormatList = List[SupportedFormat]
+
+def handle_build_cancel(proc: Optional[asyncio.subprocess.Process],
+                        status_reporter: edgutil.AsyncStatusReporter,
+                        spec_label: str) -> None:
+  if not edgutil.handle_proc_cancel(proc):
+    return
+
+  status_reporter.print(f"X {spec_label}")
+
+MAJOR_VERSION_SEARCH_RE = re.compile(
+  r'major_version \(Version\):\n\s+([0-9]+)',
+  re.MULTILINE
+)
+
+MINOR_VERSION_SEARCH_RE = re.compile(
+  r'minor_version \(Version\):\n\s+([0-9]+)',
+  re.MULTILINE
+)
+
+async def build_ifc_spec(status_reporter: edgutil.AsyncStatusReporter,
+                         format: SupportedFormat):
+  # Forward declare proc so that it can be handled if this coroutine gets
+  # canceled.
+  proc = None
+
+  expected_version_str = str(format[1])
+  spec_label = f"{format[0]}-{expected_version_str}"
+
+  try:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      ifc_src_path = Path(tmp_dir, 'test.ixx')
+      with open(ifc_src_path, 'w') as file:
+        file.write('export module test;\n')
+
+      # Build the empty "test" module.
+      proc = await asyncio.create_subprocess_exec(
+        'rem-build-ifc',
+        '--spec',
+        spec_label,
+        str(ifc_src_path),
+        cwd = tmp_dir,
+        stdout = asyncio.subprocess.PIPE,
+        stderr = asyncio.subprocess.STDOUT,
+        start_new_session = True
+      )
+
+      stdout, _ = await proc.communicate()
+      output = stdout.decode()
+
+      # Make sure an IFC file was produced.
+      ifc_path = Path(tmp_dir, 'test.ifc')
+      if not ifc_path.exists():
+        status_reporter.print(f"{spec_label} failed to produce an IFC")
+        status_reporter.print(output, end = '')
+        return
+
+      # Run ifc-dump to verify the file and extract the version information.
+      proc = await asyncio.create_subprocess_exec(
+        'ifc-dump',
+        str(ifc_path),
+        cwd = tmp_dir,
+        stdout = asyncio.subprocess.PIPE,
+        stderr = asyncio.subprocess.STDOUT,
+        start_new_session = True
+      )
+
+      stdout, _ = await proc.communicate()
+      output = stdout.decode()
+
+      # Check the version information.
+      major_version = MAJOR_VERSION_SEARCH_RE.search(output)
+      if not major_version:
+        status_reporter.print(f"{spec_label} - could not find major version")
+        status_reporter.print(output, end = '')
+        return
+
+      minor_version = MINOR_VERSION_SEARCH_RE.search(output)
+      if not minor_version:
+        status_reporter.print(f"{spec_label} - could not find minor version")
+        status_reporter.print(output, end = '')
+        return
+
+      combined_version = f"{major_version.group(1)}.{minor_version.group(1)}"
+      if combined_version != expected_version_str:
+        status_reporter.print(f"{spec_label} - wrong IFC version produced")
+        status_reporter.print(output, end = '')
+        return
+
+      # All implemented checks pass (ifc-dump validated the SHA checksum and
+      # the version numbers matched the expected version numbers)
+      status_reporter.print(f"{spec_label} - OKAY")
+  except asyncio.CancelledError:
+    handle_build_cancel(proc, status_reporter, spec_label)
+
+async def run_testing(loop: asyncio.AbstractEventLoop,
+                      formats: SupportedFormatList) -> None:
+  job_loop = edgutil.AsyncJobLoop(loop, max_jobs = 4)
+
+  task_status = RebuildStatus(len(formats))
+
+  # Create the status reporter.
+  def get_current_status():
+    return f"{task_status.num_completed}/{task_status.num_total}"
+  status_reporter = edgutil.AsyncStatusReporter(get_current_status)
+
+  # Add the main set of jobs, and run the task.
+  try:
+    def supply_job() -> Optional[Coroutine]:
+      if len(formats) > 0:
+        return build_ifc_spec(
+          status_reporter,
+          formats.pop()
+        )
+
+      return None
+
+    def update_callback(done_tasks: Set[asyncio.Task]) -> bool:
+      task_status.num_completed += len(done_tasks)
+      status_reporter.print_status_line()
+      return False
+
+    await job_loop.run_supplier(supply_job, update_callback)
+  finally:
+    status_reporter.cleanup_status_line()
+
+def _get_supported_formats() -> SupportedFormatList:
+  '''Return an array of tuple values containing the pair of the IFC spec
+  identifier and IFC version that should be produced.'''
+  results = []
+  supported_format_text = edgshell.read_process_output(
+    ['rem-build-ifc-list-specs']
+  )
+  for line in re.finditer(r'([0-9\.]+)-([0-9\.]+)', supported_format_text):
+    results.append((line.group(1), line.group(2)))
+  return results
+
+def _print_supported_formats(formats: SupportedFormatList) -> None:
+  for compiler_version, ifc_version in formats:
+    print(
+      f" - IFC Version: {ifc_version} as produced by MSVC {compiler_version}"
+    )
+
+def main() -> None:
+  args, unknown_args = parse_args()
+
+  print('Retrieving supported format list from the remote...')
+  supported_formats = _get_supported_formats()
+  print('Testing the following supported formats...')
+  _print_supported_formats(supported_formats)
+  def consume_loop(loop):
+    return run_testing(loop, supported_formats)
+  edgutil.run_asyncio_loop(consume_loop)
+
+main()

@@ -1,0 +1,176 @@
+#!/bin/bash -e
+
+# Copyright 2026 Edison Design Group, Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Update the ms_modules "inc" and "ifc" folders.
+#
+# usage: rem-update-msmod-system-files [--s|spec <spec>][--direct-output]
+#
+#     -s, --spec <spec>  Attempt to build an IFC file for the given
+#                        specification version.
+#     --direct-output    Include the direct output from the remote script.
+#                        This should only be used for debugging crashes in the
+#                        remote script, under normal operation this will
+#                        give no additional output other than a terminal reset.
+#
+# Downloads remote IFC and header files to the current working directory's
+# "ifc" and "inc" folders.
+#
+# This script requires the requirements of rem-build-ifc be satisfied to
+# operate correctly.
+
+# Controls the spec to retrieve files for.
+spec='latest'
+# Controls the flow of output from the remote script execution.
+script_direct_output_dest='/dev/null'
+
+while (( $# > 0 )) ; do
+  case $1 in
+    -s | --spec)
+      spec=$2
+      shift
+      ;;
+    --direct-output)
+      script_direct_output_dest='/dev/stdout'
+      ;;
+    -*)
+      echo "rem-update-msmod-system-files: $1 is an unrecognized option"
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+  shift
+done
+
+# We use C:\RemIFC\builds as an easy to cleanup parent directory (both for
+# automated and emergency cleanup), that doesn't need parents created.
+tmp_dir="C:\\RemIFC\\builds\\$(mktemp -u msmod_system_update_XXXXXX)"
+
+# Create a remote temporary working directory.
+echo "Making working directory directory \"$tmp_dir\"..."
+ssh msvs.edg.com "mkdir \"$tmp_dir\""
+
+# Create a local temporary output directory.
+local_tmp_dir=$(mktemp -p '' -d rem-update-msmod-system-files.tmp.XXXXXX)
+
+# Register cleanup for the aforementioned temporary directories.
+function cleanup_tmp_dirs() {
+  # Cleanup local temporaries.
+  rm -rf $local_tmp_dir
+
+  # Cleanup remote temporaries.
+  echo "Cleaning up working directory directory \"$tmp_dir\"..."
+  ssh msvs.edg.com "rmdir /s /q $tmp_dir"
+}
+
+trap cleanup_tmp_dirs EXIT
+
+# Function called to copying the referenced file, convert it to Unix-style line
+# endings, and then printing that it's finished with the file.
+function copy_file() {
+  local replace_line_endings=$1
+  local remote_file="msvs.edg.com:$2"
+  local local_file="$3"
+
+  # Copy the file.
+  edg-scp-from-win "$remote_file" "$local_file"
+
+  # Fix the line endings, if this is a file we should modify line endings for.
+  if (( $replace_line_endings != 0 )) ; then
+    sed -i 's/\r$//' "$local_file"
+  fi
+
+  # Print that we're done with this file.
+  echo "$local_file"
+}
+
+# Expose this to shells in child processes.
+export -f copy_file
+
+# Function called to obtain and download a list of files from the remote.
+function download_from_remote() {
+  local replace_line_endings=$1
+  local resource_name="$2"
+  local folder_name="$3"
+
+  # Create or recreate the folder.
+  if [[ -d "$folder_name" ]] ; then
+    rm -rf "$folder_name"
+  fi
+  mkdir "$folder_name"
+
+  # Execute a remote dump operation.
+  # Use -o LogLevel=QUIET to get rid of the connection closed message
+  # Use -tt to tell ssh to always execute in a remote shell
+  #
+  # We work around the following issue by writing to a log file on the remote
+  # the reading that back locally.
+  # https://github.com/PowerShell/Win32-OpenSSH/issues/1738
+  ssh -o LogLevel=QUIET -tt msvs.edg.com \
+    "cd $tmp_dir &&"\
+    "py C:\\RemIFC\\build-ifc.py /log /dump $resource_name /spec $spec" \
+        > "$script_direct_output_dest"
+
+  # Copy the output.log to the temporary output directory.
+  echo "Retrieving file list dump for $resource_name..."
+  local local_output_log="$local_tmp_dir/output.log"
+  edg-scp-from-win "msvs.edg.com:$tmp_dir/output.log" "$local_output_log"
+
+  # Work through the output.log file which should contain all the information
+  # we need from its dump.
+  local to_copy=()
+  mapfile -t to_copy < "$local_output_log"
+
+  # Enter the output directory.
+  pushd "$folder_name" > /dev/null
+    # Download files in parallel using GNU parallel's semaphore.
+    echo "Downloading files..."
+    # The first line is the base directory, store it with Unix-style path
+    # separators, then iterate on subsequent elements.
+    local remote_base_dir=$(echo "${to_copy[0]}" | sed 's@\\@/@g')
+    for remote_file in ${to_copy[@]:1} ; do
+      # Convert the remote file to Unix-style path separators as this is
+      # what copy_file expects.
+      remote_file=$(echo "$remote_file" | sed -e 's@\\@/@g')
+      # Remove the remote base directory prefix to get a local relative path.
+      local local_file=$(echo "$remote_file" | sed -e "s@$remote_base_dir@@")
+
+      # If our local file ends with a path separator, create a directory
+      # instead.
+      if [[ "$local_file" == */ ]] ; then
+        mkdir "$local_file"
+        continue
+      fi
+
+      # Copy the remote file in parallel.
+      parallel --semaphore --jobs 8 \
+        copy_file $replace_line_endings "$remote_file" "$local_file"
+    done
+    # Wait for launched parallel download jobs to finish.
+    parallel --semaphore --wait
+  popd > /dev/null
+}
+
+# Download files, replacing line endings for header files.
+download_from_remote 0 "ifcs" "ifc"
+download_from_remote 1 "headers" "inc"

@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+
+# Copyright 2026 Edison Design Group, Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import asyncio
+import argparse
+import os
+import shutil
+import tempfile
+import traceback
+
+import edgifc
+import edgutil
+
+from pathlib import Path
+from typing import Coroutine, Dict, List, Optional, Set
+
+def parse_args():
+  parser = argparse.ArgumentParser(
+    description = (
+      '''Rebuilds all ifcspec files (via rem-build-ifc) in this directory
+      or below.
+
+      This script requires the requirements of rem-build-ifc to be satisfied to
+      operate correctly.
+      '''
+    )
+  )
+  parser.add_argument(
+    '--delete-test-if-build-fails',
+    dest = 'delete_failed_builds',
+    action = 'store_true',
+    help = (
+      'delete the associated test if one of its ifcspec files fails to build'
+    )
+  )
+  parser.add_argument(
+    '--update-msmod-system',
+    dest = 'update_msmod',
+    action = 'store_true',
+    help = (
+      'update the associated system files in the current working directory'
+    )
+  )
+  parser.add_argument(
+    '--rebuild-all',
+    '-f',
+    dest = 'rebuild_all',
+    action = 'store_true',
+    help = (
+      'rebuild all discovered ifcspec files'
+    )
+  )
+  parser.add_argument(
+    '--spec',
+    dest = 'spec',
+    default = 'latest',
+    help = (
+      'the IFC specification version to use for building the ifcspec files '
+      'and updating system files'
+    )
+  )
+  return parser.parse_known_args()
+
+async def update_msmodules(status_reporter: edgutil.AsyncStatusReporter,
+                           spec: str) -> None:
+  # Forward declare proc so that it can be handled if this coroutine gets
+  # canceled.
+  proc = None
+
+  try:
+    proc = await asyncio.create_subprocess_exec(
+      'rem-update-msmod-system-files',
+      '--spec',
+      spec,
+      stdout = asyncio.subprocess.PIPE,
+      stderr = asyncio.subprocess.PIPE,
+      start_new_session = True
+    )
+
+    stdout, _ = await proc.communicate()
+
+    status_reporter.print(stdout.decode(), end = '')
+  except asyncio.CancelledError:
+    edgutil.handle_proc_cancel(proc)
+
+def collect_ifcspec_paths(starting_path: Path) -> List[Path]:
+  paths = []
+  for root, _, filenames in os.walk(starting_path):
+    for filename in filenames:
+      file_path = Path(root, filename)
+      if file_path.suffix != '.ifcspec':
+        continue
+
+      paths.append(file_path)
+  return paths
+
+def _is_out_of_date_or_missing_ifcs(ifcspec_dir: Path,
+                                    desired_spec: str) -> bool:
+  ifc_files_missing = True
+  for root, _, filenames in os.walk(ifcspec_dir):
+    for filename in filenames:
+      file_path = Path(root, filename)
+      if file_path.suffix != '.ifc':
+        continue
+
+      ifc_files_missing = False
+      with open(file_path, 'rb') as file_handle:
+        reader = edgifc.IFCReader(file_handle)
+        reader.init_file()
+
+        header = reader.get_header()
+        version_string = f"{header.major_version()}.{header.minor_version()}"
+        # IF the version doesn't match, stop the search and return true.
+        if version_string != desired_spec:
+          return True
+
+  # If there were no IFC files found, return True as clearly some need built.
+  return ifc_files_missing
+
+def prune_ifcspec_paths(paths: List[Path], desired_spec: str) -> List[Path]:
+  pruned_paths: List[Path] = []
+
+  num_paths_considered = 0
+  num_paths_total = len(paths)
+
+  # Create the status reporter.
+  def get_current_status():
+    return (
+      f"Will rebuild {len(pruned_paths)} IFC spec files "
+      f"({num_paths_considered}/{num_paths_total})"
+    )
+  status_reporter = edgutil.AsyncStatusReporter(get_current_status)
+
+  for index, path in enumerate(paths):
+    num_paths_considered += 1
+    if _is_out_of_date_or_missing_ifcs(path.parent, desired_spec):
+      pruned_paths.append(path)
+    status_reporter.print_status_line()
+
+  status_reporter.cleanup_status_line()
+  return pruned_paths
+
+class RebuildStatus:
+  def __init__(self, num_total: int) -> None:
+    self.num_completed = 0
+    self.num_total = num_total
+
+def cleanup_output(output):
+  return output.replace(f"{os.getcwd()}{os.sep}", '')
+
+def handle_build_cancel(proc: Optional[asyncio.subprocess.Process],
+                        status_reporter: edgutil.AsyncStatusReporter,
+                        ifcspec_path: Path) -> None:
+  if not edgutil.handle_proc_cancel(proc):
+    return
+
+  status_reporter.print(cleanup_output(f"X {ifcspec_path}"))
+
+async def build_ifc_spec(status_reporter: edgutil.AsyncStatusReporter,
+                         failure_log_file: Path, spec: str,
+                         forwarded_flags: List[str], ifcspec_path: Path):
+  # Forward declare proc so that it can be handled if this coroutine gets
+  # canceled.
+  proc = None
+
+  try:
+    proc = await asyncio.create_subprocess_exec(
+      'rem-build-ifc',
+      '--batch',
+      '--spec',
+      spec,
+      '--failure-log-file',
+      str(failure_log_file),
+      *forwarded_flags,
+      str(ifcspec_path),
+      stdout = asyncio.subprocess.PIPE,
+      stderr = asyncio.subprocess.STDOUT,
+      start_new_session = True
+    )
+
+    stdout, _ = await proc.communicate()
+
+    status_reporter.print(cleanup_output(stdout.decode()), end = '')
+  except asyncio.CancelledError:
+    handle_build_cancel(proc, status_reporter, ifcspec_path)
+
+async def run_rebuild(loop: asyncio.AbstractEventLoop, failure_log_file: Path,
+                      spec: str, forwarded_flags: List[str], *,
+                      update_system: bool, rebuild_all: bool) -> None:
+  job_loop = edgutil.AsyncJobLoop(loop, max_jobs = 4)
+
+  ifcspec_paths = collect_ifcspec_paths(Path(os.getcwd()))
+  if not rebuild_all:
+    ifcspec_paths = prune_ifcspec_paths(ifcspec_paths, spec)
+  task_status = RebuildStatus(len(ifcspec_paths))
+
+  # Create the status reporter.
+  def get_current_status():
+    return f"{task_status.num_completed}/{task_status.num_total}"
+  status_reporter = edgutil.AsyncStatusReporter(get_current_status)
+
+  # Add a job into the queue for updating the modules system files.
+  if update_system:
+    task_status.num_total += 1
+    job_loop.add_task(update_msmodules(status_reporter, spec))
+
+  # Add the main set of jobs, and run the task.
+  try:
+    def supply_job() -> Optional[Coroutine]:
+      if len(ifcspec_paths) > 0:
+        return build_ifc_spec(
+          status_reporter,
+          failure_log_file,
+          spec,
+          forwarded_flags,
+          ifcspec_paths.pop()
+        )
+
+      return None
+
+    def update_callback(done_tasks: Set[asyncio.Task]) -> bool:
+      task_status.num_completed += len(done_tasks)
+      status_reporter.print_status_line()
+      return False
+
+    await job_loop.run_supplier(supply_job, update_callback)
+  finally:
+    status_reporter.cleanup_status_line()
+
+def _build_test_dir_cache(test_dir: Path) -> Dict[str, Path]:
+  cache = {}
+  for entry in os.listdir(test_dir):
+    entry_path = test_dir.joinpath(entry)
+    if not entry_path.is_file():
+      continue
+
+    cache[entry_path.stem] = entry_path
+  return cache
+
+def _remove_file(file_path: Path) -> None:
+  print(cleanup_output(f"- {file_path}"))
+  file_path.unlink()
+
+def _remove_directory_tree(dir_path: Path) -> None:
+  for root, _, filenames in os.walk(dir_path):
+    for filename in filenames:
+      file_path = os.path.join(root, filename)
+      print(cleanup_output(f"- {file_path}"))
+
+  shutil.rmtree(dir_path)
+
+def cleanup_failed_tasks(failure_log_file: Path) -> None:
+  directory_cache = {}
+  with open(failure_log_file, 'r') as file_handle:
+    for failure_line in file_handle:
+      print(cleanup_output(f"Cleaning up {failure_line.strip()}..."))
+      try:
+        failing_ifcspec_path = Path(failure_line)
+
+        test_assoc_files_dir = failing_ifcspec_path.parent
+        directory_of_tests = test_assoc_files_dir.parent
+        if test_assoc_files_dir.name[0] != '.':
+          print('This doesn\'t seem to be a testing directory? Skipping.')
+          continue
+
+        test_name = test_assoc_files_dir.name[1:]
+        if directory_of_tests not in directory_cache:
+          cache = _build_test_dir_cache(directory_of_tests)
+          directory_cache[directory_of_tests] = cache
+
+        test_path = directory_cache[directory_of_tests][test_name]
+        _remove_file(test_path)
+        _remove_directory_tree(test_assoc_files_dir)
+      except:
+        print('Cleanup failed.')
+        traceback.print_exc()
+
+def main() -> None:
+  args, unknown_args = parse_args()
+
+  spec_version = args.spec
+  if spec_version == 'latest':
+    spec_version = str(edgifc.SUPPORTED_VERSIONS[-1])
+
+  failure_info_dir = tempfile.mkdtemp(prefix = 'ifcspec-mass-build')
+  try:
+    failure_log_file = Path(failure_info_dir, 'failures.log')
+    failure_log_file.touch()
+    def consume_loop(loop):
+      return run_rebuild(
+        loop,
+        failure_log_file,
+        spec_version,
+        unknown_args,
+        update_system = args.update_msmod,
+        rebuild_all = args.rebuild_all
+      )
+
+    edgutil.run_asyncio_loop(consume_loop)
+  finally:
+    if args.delete_failed_builds:
+      cleanup_failed_tasks(failure_log_file)
+    shutil.rmtree(failure_info_dir)
+
+main()

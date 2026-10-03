@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+
+# Copyright 2026 Edison Design Group, Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+#
+# This is a bare bones utility script printing the dependencies of an ifcspec
+# to be used primarily by other scripts (e.g., rem-build-ifc and friends).
+#
+# The script takes an ifcspec file path and prints relative paths (relative to
+# the passed ifcspec file's directory) of all files required to build that
+# ifcspec, including the ifcspec itself.
+#
+
+import os
+import sys
+
+from pathlib import Path
+from typing import List, Set
+
+def validate_spec_file(specfile_path: Path) -> None:
+  '''Validate the spec file argument, exit if incorrect.'''
+  if not specfile_path.suffix == '.ifcspec':
+    print(
+      f"Provided file \"{specfile_path}\" is not an \".ifcspec\" file"
+    )
+    sys.exit(1)
+
+  if not specfile_path.exists():
+    print(
+      f"ifcspec file \"{specfile_path}\" does not exist"
+    )
+    sys.exit(1)
+
+def read_dependencies_line(spec_file: Path) -> List[Path]:
+  '''Read the spec file and return a list of dependencies.'''
+  with open(spec_file, 'r') as ifcspec_file:
+    for line in ifcspec_file.readlines():
+      if not line.startswith('REQUIRES_FILES'):
+        continue
+
+      cleaned_up_line = line.strip().replace('REQUIRES_FILES=', '')
+      split_paths = cleaned_up_line.split(' ')
+      return list(map(lambda x: Path(x), split_paths))
+
+  return []
+
+def collect_dependencies(dependencies: Set[Path], spec_file: Path):
+  '''Collect all dependencies for this spec file recursively.
+
+  This adds all files, the spec file itself, the spec file's dependencies, all
+  dependent ifcspec files recursively into the passed dependencies set.
+  '''
+  # Add self to the dependency set so it won't be reprocessed.
+  dependencies.add(spec_file)
+
+  # Get the dependencies declared by this file.
+  new_dependencies = read_dependencies_line(spec_file)
+  for new_dependency in new_dependencies:
+    # Skip files we've already encountered.
+    if new_dependency in dependencies:
+      continue
+
+    # If this is an ifcspec recurse (the recursion will add the file),
+    # otherwise, just add the file.
+    if new_dependency.suffix == '.ifcspec':
+      collect_dependencies(dependencies, new_dependency)
+    else:
+      dependencies.add(new_dependency)
+
+def print_dependencies(dependencies: Set[Path]) -> None:
+  '''Prints dependencies space separated (as that's easy for bash to handle).
+  '''
+  print(' '.join(map(lambda x: str(x), dependencies)))
+
+def main() -> None:
+  root_spec_file = Path(sys.argv[1])
+  validate_spec_file(root_spec_file)
+
+  dependencies: Set[Path] = set()
+  collect_dependencies(dependencies, root_spec_file)
+  print_dependencies(dependencies)
+
+main()
